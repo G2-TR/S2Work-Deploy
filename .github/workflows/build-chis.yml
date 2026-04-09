@@ -1,0 +1,155 @@
+name: Build and Deploy G2Chis
+
+on:
+  workflow_dispatch:
+    inputs:
+      repository_url:
+        description: Git clone URL. Leave empty to use secret G2CHIS_REPO.
+        required: false
+        type: string
+      build_path:
+        description: Go package path to build.
+        required: false
+        default: .
+        type: string
+      goos:
+        description: Target GOOS.
+        required: false
+        default: linux
+        type: string
+      goarch:
+        description: Target GOARCH.
+        required: false
+        default: amd64
+        type: string
+      cgo_enabled:
+        description: CGO_ENABLED value used for the build.
+        required: false
+        default: '0'
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    env:
+      BINARY_NAME: G2Chis
+      DEPLOY_PATH: /storage/sites/G2/G2Chis
+      BACKUP_DIR: /storage/sites/G2/G2Chis_old
+
+    steps:
+      - name: Resolve repository URL
+        id: repo
+        env:
+          INPUT_REPOSITORY_URL: ${{ inputs.repository_url }}
+          SECRET_REPOSITORY_URL: ${{ secrets.G2CHIS_REPO }}
+        run: |
+          set -e
+          REPO_URL="$INPUT_REPOSITORY_URL"
+          if [ -z "$REPO_URL" ]; then
+            REPO_URL="$SECRET_REPOSITORY_URL"
+          fi
+          if [ -z "$REPO_URL" ]; then
+            echo "Repository URL is not configured. Provide workflow input 'repository_url' or secret G2CHIS_REPO."
+            exit 1
+          fi
+          echo "::add-mask::$REPO_URL"
+          echo "url=$REPO_URL" >> "$GITHUB_OUTPUT"
+
+      - name: Clone service source
+        run: |
+          set -e
+          git clone --depth 1 --branch "prod-merge" --single-branch "${{ steps.repo.outputs.url }}" source
+          test -f source/go.mod
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: source/go.mod
+          cache-dependency-path: |
+            source/go.sum
+            source/go.work.sum
+
+      - name: Install UPX
+        uses: crazy-max/ghaction-upx@v4
+        with:
+          install-only: true
+
+      - name: Build binary
+        working-directory: ./source
+        env:
+          CGO_ENABLED: ${{ inputs.cgo_enabled }}
+          GOOS: ${{ inputs.goos }}
+          GOARCH: ${{ inputs.goarch }}
+        run: |
+          set -e
+          mkdir -p ../dist
+          go mod download
+          go build -trimpath -ldflags="-s -w" -o "../dist/${BINARY_NAME}" "${{ inputs.build_path }}"
+          ls -lh "../dist/${BINARY_NAME}"
+
+      - name: Compress binary with UPX
+        run: |
+          set -e
+          upx -fq "dist/${BINARY_NAME}"
+          ls -lh "dist/${BINARY_NAME}"
+
+      - name: Upload binary artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: G2Chis
+          path: dist/G2Chis
+          retention-days: 7
+
+      - name: Setup sshpass
+        run: |
+          set -e
+          sudo apt-get update
+          sudo apt-get install -y sshpass
+          mkdir -p ~/.ssh
+          ssh-keyscan -p ${{ secrets.MAIN_SERVER_PORT }} ${{ secrets.MAIN_SERVER_HOST }} >> ~/.ssh/known_hosts
+
+      - name: Upload binary to server temp path
+        run: |
+          set -e
+          sshpass -p "${{ secrets.SSH_PASSWORD }}" scp -P ${{ secrets.MAIN_SERVER_PORT }} "dist/${BINARY_NAME}" root@${{ secrets.MAIN_SERVER_HOST }}:/tmp/${BINARY_NAME}_${{ github.run_id }}
+
+      - name: Backup old binary and deploy new binary
+        run: |
+          set -e
+          sshpass -p "${{ secrets.SSH_PASSWORD }}" ssh -p ${{ secrets.MAIN_SERVER_PORT }} root@${{ secrets.MAIN_SERVER_HOST }} <<'EOF'
+          set -e
+          BINARY_NAME="G2Chis"
+          DEPLOY_PATH="/storage/sites/G2/G2Chis"
+          BACKUP_DIR="/storage/sites/G2/G2Chis_old"
+          TEMP_PATH="/tmp/G2Chis_${{ github.run_id }}"
+          mkdir -p "$(dirname "$DEPLOY_PATH")" "$BACKUP_DIR"
+          if [ -f "$DEPLOY_PATH" ]; then
+            BACKUP_PATH="$BACKUP_DIR/${BINARY_NAME}_$(date +"%Y%m%d_%H%M%S")"
+            cp -p "$DEPLOY_PATH" "$BACKUP_PATH"
+            echo "Backup created: $BACKUP_PATH"
+          else
+            echo "No existing binary to backup"
+          fi
+          mv "$TEMP_PATH" "$DEPLOY_PATH"
+          chmod +x "$DEPLOY_PATH"
+          supervisorctl restart CHIS:
+          echo "Deployment completed successfully"
+          EOF
+
+      - name: Verify deployment
+        run: |
+          set -e
+          sshpass -p "${{ secrets.SSH_PASSWORD }}" ssh -p ${{ secrets.MAIN_SERVER_PORT }} root@${{ secrets.MAIN_SERVER_HOST }} <<'EOF'
+          set -e
+          DEPLOY_PATH="/storage/sites/G2/G2Chis"
+          if [ -f "$DEPLOY_PATH" ]; then
+            echo "Deployment verified: binary exists"
+            ls -lh "$DEPLOY_PATH"
+          else
+            echo "ERROR: binary not found after deployment"
+            exit 1
+          fi
+          EOF
