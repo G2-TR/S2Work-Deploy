@@ -14,7 +14,7 @@ on:
           - G2Work
           - G2Plat
       repository_url:
-        description: Git clone URL. Leave empty to use G2CHIS_REPO for G2Chis, or provide it explicitly for the other services.
+        description: Git clone URL. Leave empty to use secret G2CHIS_REPO.
         required: false
         type: string
       source_branch:
@@ -141,21 +141,17 @@ jobs:
       - name: Resolve repository URL
         id: repo
         env:
-          SERVICE: ${{ steps.service.outputs.service }}
           INPUT_REPOSITORY_URL: ${{ inputs.repository_url }}
           CHIS_REPOSITORY_URL: ${{ secrets.G2CHIS_REPO }}
         run: |
           set -e
-          DEFAULT_REPOSITORY_URL=""
-          if [ "$SERVICE" = "G2Chis" ]; then
-            DEFAULT_REPOSITORY_URL="$CHIS_REPOSITORY_URL"
-          fi
+          DEFAULT_REPOSITORY_URL="$CHIS_REPOSITORY_URL"
           REPOSITORY_URL="$INPUT_REPOSITORY_URL"
           if [ -z "$REPOSITORY_URL" ]; then
             REPOSITORY_URL="$DEFAULT_REPOSITORY_URL"
           fi
           if [ -z "$REPOSITORY_URL" ]; then
-            echo "Repository URL is not configured. Provide workflow input 'repository_url'. G2Chis can also fall back to secret G2CHIS_REPO."
+            echo "Repository URL is not configured. Provide workflow input 'repository_url' or secret G2CHIS_REPO."
             exit 1
           fi
           echo "::add-mask::$REPOSITORY_URL"
