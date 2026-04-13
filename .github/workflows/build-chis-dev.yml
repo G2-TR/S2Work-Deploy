@@ -1,0 +1,218 @@
+name: Build and Deploy G2Chis Dev
+
+on:
+  workflow_dispatch:
+    inputs:
+      repository_url:
+        description: Git clone URL. Leave empty to use secret G2CHIS_REPO.
+        required: false
+        type: string
+      source_branch:
+        description: Git branch to clone.
+        required: false
+        default: prod-merge
+        type: string
+      binary_name:
+        description: Binary filename override. Leave empty to use G2Chis.
+        required: false
+        type: string
+      deploy_path:
+        description: Absolute deployment path override. Leave empty to use the default G2Chis path.
+        required: false
+        type: string
+      backup_dir:
+        description: Absolute backup directory override. Leave empty to use the default G2Chis backup directory.
+        required: false
+        type: string
+      supervisor_target:
+        description: supervisorctl target override. Leave empty to use CHIS:.
+        required: false
+        type: string
+      build_path:
+        description: Go package path to build.
+        required: false
+        default: .
+        type: string
+      goos:
+        description: Target GOOS.
+        required: false
+        default: linux
+        type: string
+      goarch:
+        description: Target GOARCH.
+        required: false
+        default: amd64
+        type: string
+      cgo_enabled:
+        description: CGO_ENABLED value used for the build.
+        required: false
+        default: '0'
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: self-hosted
+
+    steps:
+      - name: Resolve deployment settings
+        id: settings
+        env:
+          INPUT_BINARY_NAME: ${{ inputs.binary_name }}
+          INPUT_DEPLOY_PATH: ${{ inputs.deploy_path }}
+          INPUT_BACKUP_DIR: ${{ inputs.backup_dir }}
+          INPUT_SUPERVISOR_TARGET: ${{ inputs.supervisor_target }}
+        run: |
+          set -e
+          BINARY_NAME="$INPUT_BINARY_NAME"
+          if [ -z "$BINARY_NAME" ]; then
+            BINARY_NAME="G2Chis"
+          fi
+
+          DEPLOY_PATH="$INPUT_DEPLOY_PATH"
+          if [ -z "$DEPLOY_PATH" ]; then
+            DEPLOY_PATH="/storage/sites/G2/G2Chis"
+          fi
+
+          BACKUP_DIR="$INPUT_BACKUP_DIR"
+          if [ -z "$BACKUP_DIR" ]; then
+            BACKUP_DIR="/storage/sites/G2/G2Chis_old"
+          fi
+
+          SUPERVISOR_TARGET="$INPUT_SUPERVISOR_TARGET"
+          if [ -z "$SUPERVISOR_TARGET" ]; then
+            SUPERVISOR_TARGET="CHIS:"
+          fi
+
+          TEMP_PATH="/tmp/${BINARY_NAME}_${{ github.run_id }}"
+
+          echo "binary_name=$BINARY_NAME" >> "$GITHUB_OUTPUT"
+          echo "deploy_path=$DEPLOY_PATH" >> "$GITHUB_OUTPUT"
+          echo "backup_dir=$BACKUP_DIR" >> "$GITHUB_OUTPUT"
+          echo "supervisor_target=$SUPERVISOR_TARGET" >> "$GITHUB_OUTPUT"
+          echo "temp_path=$TEMP_PATH" >> "$GITHUB_OUTPUT"
+
+      - name: Resolve repository URL
+        id: repo
+        env:
+          INPUT_REPOSITORY_URL: ${{ inputs.repository_url }}
+          DEFAULT_REPOSITORY_URL: ${{ secrets.G2CHIS_REPO }}
+        run: |
+          set -e
+          REPOSITORY_URL="$INPUT_REPOSITORY_URL"
+          if [ -z "$REPOSITORY_URL" ]; then
+            REPOSITORY_URL="$DEFAULT_REPOSITORY_URL"
+          fi
+          if [ -z "$REPOSITORY_URL" ]; then
+            echo "Repository URL is not configured. Provide workflow input 'repository_url' or secret G2CHIS_REPO."
+            exit 1
+          fi
+          echo "::add-mask::$REPOSITORY_URL"
+          echo "repository_url=$REPOSITORY_URL" >> "$GITHUB_OUTPUT"
+
+      - name: Clone service source
+        run: |
+          set -e
+          git clone --depth 1 --branch "${{ inputs.source_branch }}" --single-branch "${{ steps.repo.outputs.repository_url }}" source
+          test -f source/go.mod
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: source/go.mod
+          cache-dependency-path: |
+            source/go.sum
+            source/go.work.sum
+
+      - name: Install UPX
+        uses: crazy-max/ghaction-upx@v4
+        with:
+          install-only: true
+
+      - name: Build binary
+        working-directory: ./source
+        env:
+          BINARY_NAME: ${{ steps.settings.outputs.binary_name }}
+          CGO_ENABLED: ${{ inputs.cgo_enabled }}
+          GOOS: ${{ inputs.goos }}
+          GOARCH: ${{ inputs.goarch }}
+        run: |
+          set -e
+          mkdir -p ../dist
+          go mod download
+          go build -trimpath -ldflags="-s -w" -o "../dist/${BINARY_NAME}" "${{ inputs.build_path }}"
+          ls -lh "../dist/${BINARY_NAME}"
+
+      - name: Compress binary with UPX
+        env:
+          BINARY_NAME: ${{ steps.settings.outputs.binary_name }}
+        run: |
+          set -e
+          upx -fq "dist/${BINARY_NAME}"
+          ls -lh "dist/${BINARY_NAME}"
+
+      - name: Upload binary artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.settings.outputs.binary_name }}
+          path: dist/${{ steps.settings.outputs.binary_name }}
+          retention-days: 7
+
+      - name: Setup sshpass
+        run: |
+          set -e
+          sudo apt-get update
+          sudo apt-get install -y sshpass
+          mkdir -p ~/.ssh
+          ssh-keyscan -p ${{ secrets.MAIN_SERVER_PORT }} ${{ secrets.MAIN_SERVER_HOST }} >> ~/.ssh/known_hosts
+
+      - name: Upload binary to server temp path
+        env:
+          BINARY_NAME: ${{ steps.settings.outputs.binary_name }}
+          TEMP_PATH: ${{ steps.settings.outputs.temp_path }}
+        run: |
+          set -e
+          sshpass -p "${{ secrets.SSH_PASSWORD }}" scp -P ${{ secrets.MAIN_SERVER_PORT }} "dist/${BINARY_NAME}" root@${{ secrets.MAIN_SERVER_HOST }}:"${TEMP_PATH}"
+
+      - name: Backup old binary and deploy new binary
+        env:
+          BINARY_NAME: ${{ steps.settings.outputs.binary_name }}
+          DEPLOY_PATH: ${{ steps.settings.outputs.deploy_path }}
+          BACKUP_DIR: ${{ steps.settings.outputs.backup_dir }}
+          TEMP_PATH: ${{ steps.settings.outputs.temp_path }}
+          SUPERVISOR_TARGET: ${{ steps.settings.outputs.supervisor_target }}
+        run: |
+          set -e
+          sshpass -p "${{ secrets.SSH_PASSWORD }}" ssh -p ${{ secrets.MAIN_SERVER_PORT }} root@${{ secrets.MAIN_SERVER_HOST }} "env BINARY_NAME='${BINARY_NAME}' DEPLOY_PATH='${DEPLOY_PATH}' BACKUP_DIR='${BACKUP_DIR}' TEMP_PATH='${TEMP_PATH}' SUPERVISOR_TARGET='${SUPERVISOR_TARGET}' sh -s" <<'EOF'
+          set -e
+          mkdir -p "$(dirname "$DEPLOY_PATH")" "$BACKUP_DIR"
+          if [ -f "$DEPLOY_PATH" ]; then
+            BACKUP_PATH="$BACKUP_DIR/${BINARY_NAME}_$(date +"%Y%m%d_%H%M%S")"
+            cp -p "$DEPLOY_PATH" "$BACKUP_PATH"
+            echo "Backup created: $BACKUP_PATH"
+          else
+            echo "No existing binary to backup"
+          fi
+          mv "$TEMP_PATH" "$DEPLOY_PATH"
+          chmod +x "$DEPLOY_PATH"
+          supervisorctl restart "$SUPERVISOR_TARGET"
+          echo "Deployment completed successfully"
+          EOF
+
+      - name: Verify deployment
+        env:
+          DEPLOY_PATH: ${{ steps.settings.outputs.deploy_path }}
+        run: |
+          set -e
+          sshpass -p "${{ secrets.SSH_PASSWORD }}" ssh -p ${{ secrets.MAIN_SERVER_PORT }} root@${{ secrets.MAIN_SERVER_HOST }} "env DEPLOY_PATH='${DEPLOY_PATH}' sh -s" <<'EOF'
+          set -e
+          if [ -f "$DEPLOY_PATH" ]; then
+            echo "Deployment verified: binary exists"
+            ls -lh "$DEPLOY_PATH"
+          else
+            echo "ERROR: binary not found after deployment"
+            exit 1
+          fi
+          EOF
