@@ -125,13 +125,6 @@ jobs:
           go-version-file: source/go.mod
           cache: false
 
-      - name: Clean corrupted Go module cache
-        run: |
-          # 清理损坏的 compress 模块（根据错误路径）
-          rm -rf ~/go/pkg/mod/github.com/klauspost/compress@v1.17.6 2>/dev/null || true
-          # 或者彻底清理所有模块缓存
-          go clean -modcache 2>/dev/null || true
-
       - name: Install UPX
         uses: crazy-max/ghaction-upx@v4
         with:
