@@ -135,9 +135,6 @@ jobs:
         uses: actions/setup-go@v6
         with:
           go-version-file: source/go.mod
-          cache-dependency-path: |
-            source/go.sum
-            source/go.work.sum
 
       - name: Setup UPX
         run: |
@@ -190,8 +187,14 @@ jobs:
         env:
           BINARY_NAME: ${{ steps.settings.outputs.binary_name }}
         run: |
-          set -e
+          set +e
           upx -fq "dist/${BINARY_NAME}"
+          upx_exit=$?
+          set -e
+          # exit code 2 = AlreadyPackedException, treat as success
+          if [ $upx_exit -ne 0 ] && [ $upx_exit -ne 2 ]; then
+            exit $upx_exit
+          fi
           ls -lh "dist/${BINARY_NAME}"
 
 
