@@ -117,6 +117,7 @@ jobs:
       - name: Clone service source
         run: |
           set -e
+          rm -rf source
           git clone --depth 1 --branch "${{ inputs.source_branch }}" --single-branch "${{ steps.repo.outputs.repository_url }}" source
           test -f source/go.mod
 
